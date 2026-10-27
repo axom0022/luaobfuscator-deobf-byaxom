@@ -40,9 +40,9 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode('utf-8', 'replace')
         fields = parse_qs(raw)
         src = (fields.get('src') or [''])[0]
-        names = (fields.get('names') or ['descriptive'])[0]
+        names = (fields.get('names') or ['flat'])[0]
         if names not in deobfuscate.names2:
-            names = 'descriptive'
+            names = 'flat'
         out = ''
         if src.strip():
             try:
@@ -53,9 +53,9 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(html.escape(src), html.escape(out), names)
 
     def do_GET(self):
-        self.reply('', '', 'descriptive')
+        self.reply('', '', 'flat')
 
-    def reply(self, src, out, names='descriptive'):
+    def reply(self, src, out, names='flat'):
         body = (PAGE % (src, out,
                         'checked' if names == 'descriptive' else '',
                         'checked' if names == 'flat' else '')).encode('utf-8')
