@@ -9,6 +9,7 @@ from deobf.alpha import lift as alphalift
 from deobf.vm import lift
 from deobf import clean
 from deobf.lua import emit
+from deobf.lua import pure
 from deobf.lua.luaparse import node2
 from deobf.lua.luaast import stmtstr
 
@@ -144,9 +145,12 @@ def prune(stmts):
     while changed:
         changed = False
         for i, s in enumerate(stmts):
-            if s.kind not in ('local', 'localfunc'):
+            if s.kind in ('local', 'localfunc'):
+                defined = s.names if s.kind == 'local' else [s.name]
+            elif s.kind == 'assign' and all(t.kind == 'name' for t in s.targets):
+                defined = [t.name for t in s.targets]
+            else:
                 continue
-            defined = s.names if s.kind == 'local' else [s.name]
             rest = stmts[:i] + stmts[i + 1:]
             used = references(rest)
             if all(name not in used for name in defined):
@@ -217,7 +221,24 @@ def describenames(code):
         return None
     return out if isinstance(out, str) and out.strip() else None
 
-def withreport(code, names='descriptive'):
+def simplifyout(code, notes=None):
+    try:
+        body = luaparse.parse(code)
+    except Exception:
+        return code
+    body, folds, total = pure.simplify(body)
+    if not folds:
+        return code
+    body = prune(body)
+    try:
+        out = emit.render(body)
+        luaparse.parse(out)
+    except Exception:
+        return code
+    return out
+
+
+def withreport(code, names='flat'):
     notes = []
     code = clean.stripcomments(clean.stripheader(code))
     out = None
@@ -239,6 +260,8 @@ def withreport(code, names='descriptive'):
         if out is not None:
             notes.append('no obfuscation recovered, script passed through')
     if out is not None:
+        out = simplifyout(out, notes)
+    if out is not None:
         out = flatloc(out)
     if out is not None and names == 'descriptive':
         renamed = describenames(out)
@@ -253,6 +276,6 @@ def withreport(code, names='descriptive'):
             notes.append('output does not parse: %s' % err)
     return out, notes
 
-def deobfuscate(code, names='descriptive'):
+def deobfuscate(code, names='flat'):
     out, unused = withreport(code, names=names)
     return out
