@@ -1053,14 +1053,380 @@ def constant(stmts, counter):
     return [rename(stmt, mapping) for stmt in kept], len(drop)
 
 
-def simplify(body, rounds=4):
-    folds = 0
+
+
+def purechain(node):
+    if node.kind == 'name':
+        return True
+    if node.kind == 'str':
+        return True
+    if node.kind == 'index':
+        return purechain(node.obj) and (node.key.kind in ('str', 'num'))
+    return False
+
+
+def purerhs(node):
+    if node is None:
+        return True
+    if node.kind in ('num', 'str', 'true', 'false', 'nil', 'name', 'function'):
+        return True
+    if node.kind == 'index':
+        return purechain(node)
+    if node.kind == 'table':
+        return all(purerhs(item) for item in node.items)
+    if node.kind == 'unop':
+        return purerhs(node.expr)
+    if node.kind == 'binop':
+        return purerhs(node.left) and purerhs(node.right)
+    if node.kind == 'paren':
+        return purerhs(node.expr)
+    return False
+
+
+def mentions(node, out=None):
+    if out is None:
+        out = {}
+    if isinstance(node, luaparse.node2):
+        if node.kind == 'name':
+            out[node.name] = out.get(node.name, 0) + 1
+        for key, value in node.__dict__.items():
+            if key != 'kind':
+                mentions(value, out)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            mentions(item, out)
+    return out
+
+
+def writetargets(stmt):
+    if stmt.kind == 'local':
+        return list(stmt.names)
+    if stmt.kind == 'localfunc':
+        return [stmt.name]
+    if stmt.kind == 'assign':
+        return [t.name for t in stmt.targets if t.kind == 'name']
+    return []
+
+
+def deadends(stmts):
+    stmts = list(stmts)
+    changed = True
+    while changed:
+        changed = False
+        for i, stmt in enumerate(stmts):
+            if stmt.kind not in ('local', 'localfunc'):
+                continue
+            if stmt.kind == 'local' and not all(purerhs(e) for e in stmt.exprs):
+                continue
+            rest = stmts[:i] + stmts[i + 1:]
+            seen = {}
+            for other in rest:
+                mentions(other, seen)
+            names = writetargets(stmt)
+            if names and all(seen.get(name, 0) == 0 for name in names):
+                stmts = rest
+                changed = True
+                break
+    return stmts
+
+
+def deadstores(stmts):
+    stmts = list(stmts)
+    for i, stmt in enumerate(stmts):
+        if stmt is None:
+            continue
+        if stmt.kind != 'local' or len(stmt.names) != 1 or len(stmt.exprs) != 1:
+            continue
+        if not purerhs(stmt.exprs[0]):
+            continue
+        name = stmt.names[0]
+        before = [prev for prev in stmts[:i] if prev is not None]
+        if any(writetargets(prev).count(name) for prev in before):
+            continue
+        if any(mentions(prev).get(name) for prev in before):
+            continue
+        for j in range(i + 1, len(stmts)):
+            if stmts[j] is None:
+                continue
+            if name in readnames(stmts[j]):
+                break
+            if name in writetargets(stmts[j]):
+                later = stmts[j]
+                if later.kind != 'assign' or len(later.targets) != 1:
+                    break
+                if later.targets[0].kind != 'name' or later.targets[0].name != name:
+                    break
+                stmts[j] = luaparse.node2('local', names=[name], exprs=later.exprs)
+                stmts[i] = None
+                break
+    return [stmt for stmt in stmts if stmt is not None]
+
+
+def wholewrites(body):
+    seen = set()
+    writesof(body, seen)
+    return seen
+
+
+def dropmarked(node, out=None):
+    if out is None:
+        out = []
+    if isinstance(node, list):
+        kept = [dropmarked(item, out) for item in node]
+        return [item for item in kept if item is not None]
+    if isinstance(node, luaparse.node2):
+        if getattr(node, 'dropped', False):
+            return None
+        for key, value in list(node.__dict__.items()):
+            if key in ('kind', 'dropped'):
+                continue
+            if isinstance(value, (luaparse.node2, list)):
+                setattr(node, key, dropmarked(value, out))
+        return node
+    if isinstance(node, tuple):
+        return tuple(dropmarked(x, out) for x in node)
+    return node
+
+
+def targetnames(node, out=None):
+    if out is None:
+        out = set()
+    if isinstance(node, luaparse.node2):
+        if node.kind == 'assign':
+            for target in node.targets:
+                if target.kind == 'index':
+                    out.update(n for n in readnames(target.obj))
+            for value in node.exprs:
+                targetnames(value, out)
+            return out
+        for key, value in node.__dict__.items():
+            if key != 'kind':
+                targetnames(value, out)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            targetnames(item, out)
+    return out
+
+
+sharedkinds = ('table', 'name')
+
+
+def propagate(body):
+    written = {}
+    blocked = targetnames(body)
+    reads = {}
+    for node in luaparse.nodes(body):
+        if node.kind == 'name':
+            reads[node.name] = reads.get(node.name, 0) + 1
+    for stmt in luaparse.nodes(body):
+        for name in writetargets(stmt):
+            written[name] = written.get(name, 0) + 1
+    mapping = {}
+    for stmt in luaparse.nodes(body):
+        if stmt.kind != 'local' or len(stmt.names) != 1 or len(stmt.exprs) != 1:
+            continue
+        name = stmt.names[0]
+        value = stmt.exprs[0]
+        if written.get(name, 0) != 1:
+            continue
+        if name in blocked:
+            continue
+        if value.kind in sharedkinds and reads.get(name, 0) != 1:
+            continue
+        if value.kind in ('num', 'str', 'true', 'false', 'table'):
+            mapping[name] = value
+            stmt.dropped = True
+        elif value.kind == 'name' and value.name != name:
+            mapping[name] = value
+            stmt.dropped = True
+    if not mapping:
+        return body, 0
+    total = len(mapping)
+    body = rename(body, mapping)
+    body = dropmarked(body)
+    return body, total
+
+
+def signature(stmts):
+    total = 0
+    count = 0
+    for stmt in stmts:
+        count += 1
+        for value in mentions(stmt).values():
+            total += value
+    return count, total
+
+
+def mergelocal(stmts):
+    out = list(stmts)
+    for i, stmt in enumerate(out):
+        if stmt is None or stmt.kind != 'local' or stmt.exprs:
+            continue
+        if i + 1 >= len(out) or out[i + 1] is None:
+            continue
+        nxt = out[i + 1]
+        if nxt.kind != 'assign' or len(nxt.targets) != 1:
+            continue
+        if nxt.targets[0].kind != 'name':
+            continue
+        if nxt.targets[0].name not in stmt.names:
+            continue
+        if len(stmt.names) != 1:
+            continue
+        name = stmt.names[0]
+        reads = set()
+        for value in nxt.exprs:
+            reads.update(readnames(value))
+        if name in reads:
+            continue
+        out[i] = luaparse.node2('local', names=[name], exprs=list(nxt.exprs))
+        out[i + 1] = None
+    return [stmt for stmt in out if stmt is not None]
+
+
+def readcounts(stmts):
+    seen = {}
+    for stmt in stmts:
+        if stmt is None:
+            continue
+        for name in readnames(stmt):
+            seen[name] = seen.get(name, 0) + 1
+    return seen
+
+
+def tailinline(stmts, table, reads):
+    out = list(stmts)
+    for i, stmt in enumerate(out):
+        if stmt is None or stmt.kind != 'return' or len(stmt.exprs) != 1:
+            continue
+        call = stmt.exprs[0]
+        if call.kind != 'call' or call.func.kind != 'name':
+            continue
+        name = call.func.name
+        fn = table.get(name)
+        if fn is None or reads.get(name, 0) != 1:
+            continue
+        if getattr(fn, 'vararg', False) or hasvararg(fn):
+            continue
+        if len(call.args) != len(fn.params):
+            continue
+        if not all(arg.kind in simplekinds for arg in call.args):
+            continue
+        pre = []
+        for param, arg in zip(fn.params, call.args):
+            pre.append(luaparse.node2('local', names=[param], exprs=[clone(arg)]))
+        out[i] = luaparse.node2('do', body=pre + [clone(item) for item in fn.body])
+    return [stmt for stmt in out if stmt is not None]
+
+
+def dropdeadif(stmts):
+    out = list(stmts)
+    for i, stmt in enumerate(out):
+        if stmt is None or stmt.kind != 'if' or stmt.orelse is not None:
+            continue
+        if len(stmt.clauses) != 1:
+            continue
+        cond, body = stmt.clauses[0]
+        if not purerhs(cond):
+            continue
+        written = set()
+        for inner in body:
+            if inner.kind != 'assign' or not all(purerhs(e) for e in inner.exprs):
+                written = set()
+                break
+            for target in inner.targets:
+                if target.kind != 'name':
+                    written = set()
+                    break
+                written.add(target.name)
+        if not written:
+            continue
+        used = set()
+        for other in out[i + 1:]:
+            if other is not None:
+                used.update(readnames(other))
+        if written & used:
+            continue
+        out[i] = None
+    return [stmt for stmt in out if stmt is not None]
+
+
+def flatten(stmts):
+    out = list(stmts)
+    for i, stmt in enumerate(out):
+        if stmt.kind == 'do' and len(stmt.body) == 1 and stmt.body[0].kind == 'do':
+            out[i] = stmt.body[0]
+    return out
+
+
+def declared(stmts):
+    names = set()
+    for stmt in stmts:
+        if stmt is None:
+            continue
+        for node in luaparse.nodes(stmt):
+            if node.kind in ('local', 'localfunc', 'forin'):
+                names.update(n for n in getattr(node, 'names', None) or [getattr(node, 'name', '')] if n)
+            elif node.kind == 'fornum':
+                names.add(node.var)
+    return names
+
+
+def unwrap(stmts):
+    out = list(stmts)
+    for i, stmt in enumerate(out):
+        if stmt.kind != 'do':
+            continue
+        inner = declared(stmt.body)
+        if not inner:
+            out[i:i + 1] = list(stmt.body)
+            continue
+        outside = set()
+        for other in out[:i] + out[i + 1:]:
+            if other is not None:
+                outside.update(mentions(other))
+        if inner & outside:
+            continue
+        out[i:i + 1] = list(stmt.body)
+    return out
+
+
+def passonce(stmts):
+    recurse(stmts, passonce)
+    stmts = unwrap(flatten(dropdeadif(mergelocal(stmts))))
+    stmts, unused = propagate(stmts)
+    stmts = deadends(deadstores(stmts))
+    table = collect(stmts, {})
+    if table:
+        stmts = tailinline(stmts, table, readcounts(stmts))
+        stmts = mergelocal(stmts)
+        stmts, unused = propagate(stmts)
+        stmts = deadends(deadstores(stmts))
+    return stmts
+
+
+def junk(stmts, rounds=8):
     for unused in range(rounds):
+        before = signature(stmts)
+        stmts = passonce(stmts)
+        if signature(stmts) == before:
+            break
+    return stmts
+
+
+def simplify(body, rounds=12):
+    folds = 0
+    changed = False
+    for unused in range(rounds):
+        before = signature(body)
         body, n = fold(body)
         folds += n
-        if not n:
-            break
-    return body, folds, folds
+        body = passonce(body)
+        if signature(body) != before:
+            changed = True
+            continue
+        break
+    return body, (folds if folds else (1 if changed else 0)), folds
 
 
 def fold(body):
