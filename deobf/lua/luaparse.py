@@ -449,6 +449,20 @@ class parser:
             raise SyntaxError('syntax error at %d' % self.peek().pos)
         return node2('callstat', call=e)
 
+def nodes(node, out=None):
+    if out is None:
+        out = []
+    if isinstance(node, node2):
+        out.append(node)
+        for key, value in node.__dict__.items():
+            if key != 'kind':
+                nodes(value, out)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            nodes(item, out)
+    return out
+
+
 def parse(src):
     p = parser(lex(src))
     body = p.block()
