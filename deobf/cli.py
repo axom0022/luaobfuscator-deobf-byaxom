@@ -4,12 +4,12 @@ from deobf import clean
 
 usage = """usage: python3 cli.py [--names descriptive|flat] <input> [output]
 
-  --names descriptive   infer readable names from usage (default)
-  --names flat          keep the lifter's flat names (a0, b3, c1)
+  --names flat          keep the lifter's flat names (default)
+  --names descriptive   ask the vendored renamer for readable names
 """
 
 def main(argv):
-    names = 'descriptive'
+    names = 'flat'
     if '--names' in argv:
         i = argv.index('--names')
         try:
